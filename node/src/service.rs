@@ -12,6 +12,7 @@ use sc_finality_grandpa::SharedVoterState;
 use sc_keystore::LocalKeystore;
 use sc_telemetry::{Telemetry, TelemetryWorker};
 use sp_consensus::SlotData;
+use node_template_runtime::pallet_template::INHERENT_IDENTIFIER;
 
 // Our native executor instance.
 native_executor_instance!(
@@ -24,6 +25,106 @@ native_executor_instance!(
 type FullClient = sc_service::TFullClient<Block, RuntimeApi, Executor>;
 type FullBackend = sc_service::TFullBackend<Block>;
 type FullSelectChain = sc_consensus::LongestChain<FullBackend, Block>;
+
+use std::{pin::Pin, time};
+
+use futures::{future, future::Future};
+use sc_block_builder::{BlockBuilderApi, BlockBuilderProvider};
+use sc_client_api::backend;
+use sp_api::{ApiExt, ProvideRuntimeApi};
+use sp_blockchain::HeaderBackend;
+use sp_consensus::Proposal;
+use sp_inherents::InherentData;
+use sp_runtime::{
+	traits::{Block as BlockT, DigestFor},
+};
+use sp_transaction_pool::TransactionPool;
+use sp_consensus::ProofRecording;
+use sp_std::iter::Cycle;
+use sp_std::str::Lines;
+
+struct Proposer<B, Block: BlockT, C, A: TransactionPool, PR>  {
+	proposer: sc_basic_authorship::Proposer<B, Block, C, A, PR>,
+	value: Vec<u8>,
+}
+
+impl<A, B, Block, C, PR> sp_consensus::Proposer<Block> for
+	Proposer<B, Block, C, A, PR>
+		where
+			A: TransactionPool<Block = Block> + 'static,
+			B: backend::Backend<Block> + Send + Sync + 'static,
+			Block: BlockT,
+			C: BlockBuilderProvider<B, Block, C> + HeaderBackend<Block> + ProvideRuntimeApi<Block>
+				+ Send + Sync + 'static,
+			C::Api: ApiExt<Block, StateBackend = backend::StateBackendFor<B, Block>>
+				+ BlockBuilderApi<Block>,
+			PR: ProofRecording,
+{
+	type Transaction = backend::TransactionFor<B, Block>;
+	type Proposal = Pin<Box<dyn Future<
+		Output = Result<Proposal<Block, Self::Transaction, PR::Proof>, Self::Error>
+	> + Send>>;
+	type Error = sp_blockchain::Error;
+	type Proof = PR::Proof;
+	type ProofRecording = PR;
+
+	fn propose(
+		self,
+		inherent_data: InherentData,
+		inherent_digests: DigestFor<Block>,
+		max_duration: time::Duration,
+		block_size_limit: Option<usize>,
+	) -> Self::Proposal {
+		let mut inherent_data = inherent_data;
+		inherent_data.put_data(INHERENT_IDENTIFIER, &self.value).unwrap();
+		self.proposer.propose(inherent_data, inherent_digests, max_duration, block_size_limit)
+	}
+}
+
+struct MyProposerFactory<'a, A, B, C, PR> {
+	proposer_factory: sc_basic_authorship::ProposerFactory<A, B, C, PR>,
+	value: Cycle<Lines<'a>>
+}
+
+impl<A, B, C, PR> MyProposerFactory<'_, A, B, C, PR> {
+	pub fn new(
+		proposer_factory: sc_basic_authorship::ProposerFactory<A, B, C, PR>,
+	) -> Self {
+		MyProposerFactory {
+			proposer_factory,
+			value: 
+			"qwertyuiop
+			asdfghjkl
+			zxcvbnm".lines().cycle(),
+		}
+	}
+}
+
+impl<A, B, Block, C, PR> sp_consensus::Environment<Block> for
+	MyProposerFactory<'_, A, B, C, PR>
+		where
+			A: TransactionPool<Block = Block> + 'static,
+			B: backend::Backend<Block> + Send + Sync + 'static,
+			Block: BlockT,
+			C: BlockBuilderProvider<B, Block, C> + HeaderBackend<Block> + ProvideRuntimeApi<Block>
+				+ Send + Sync + 'static,
+			C::Api: ApiExt<Block, StateBackend = backend::StateBackendFor<B, Block>>
+				+ BlockBuilderApi<Block>,
+			PR: ProofRecording,
+{
+	
+	type Error = sp_blockchain::Error;
+	type Proposer = Proposer<B, Block, C, A, PR>;
+	type CreateProposer = future::Ready<Result<Self::Proposer, Self::Error>>;
+
+	fn init(&mut self, parent_header: &<Block as BlockT>::Header) -> Self::CreateProposer {
+		let proposer = self.proposer_factory.init(parent_header).into_inner().unwrap();
+		future::ready(Ok(Proposer{
+			proposer,
+			value: self.value.next().unwrap().as_bytes().to_vec(),
+		}))
+	}
+}
 
 pub fn new_partial(config: &Configuration) -> Result<sc_service::PartialComponents<
 	FullClient, FullBackend, FullSelectChain,
@@ -206,12 +307,14 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 	)?;
 
 	if role.is_authority() {
-		let proposer_factory = sc_basic_authorship::ProposerFactory::new(
-			task_manager.spawn_handle(),
-			client.clone(),
-			transaction_pool,
-			prometheus_registry.as_ref(),
-			telemetry.as_ref().map(|x| x.handle()),
+		let proposer_factory = MyProposerFactory::new(
+			sc_basic_authorship::ProposerFactory::new(
+				task_manager.spawn_handle(),
+				client.clone(),
+				transaction_pool,
+				prometheus_registry.as_ref(),
+				telemetry.as_ref().map(|x| x.handle()),
+			),
 		);
 
 		let can_author_with =
